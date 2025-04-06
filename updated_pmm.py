@@ -37,9 +37,9 @@ class MyPMMConfig(BaseClientModel):
         prompt_on_new=True, prompt=lambda mi: "How many candles to use for NATR and RSI calculation"))
     candle_exchange: str = Field("binance", client_data=ClientFieldData(
         prompt_on_new=True, prompt=lambda mi: "Exchange for candle data (e.g., binance)"))
-    bid_spread_scalar: Decimal = Field(120, client_data=ClientFieldData(
+    bid_spread_scalar: Decimal = Field(0.14, client_data=ClientFieldData(
         prompt_on_new=True, prompt=lambda mi: "Bid spread scalar multiplier for NATR"))
-    ask_spread_scalar: Decimal = Field(60, client_data=ClientFieldData(
+    ask_spread_scalar: Decimal = Field(0.07, client_data=ClientFieldData(
         prompt_on_new=True, prompt=lambda mi: "Ask spread scalar multiplier for NATR"))
     use_volatility_spread: bool = Field(True, client_data=ClientFieldData(
         prompt_on_new=True, prompt=lambda mi: "Use volatility-based spread adjustment (True/False)"))
@@ -47,7 +47,7 @@ class MyPMMConfig(BaseClientModel):
         prompt_on_new=True, prompt=lambda mi: "Use RSI-based trend price shifting (True/False)"))
     max_shift_spread: Decimal = Field(0.000001, client_data=ClientFieldData(
         prompt_on_new=True, prompt=lambda mi: "Maximum price shift spread (in percent)"))
-    trend_scalar: Decimal = Field(-1, client_data=ClientFieldData(
+    trend_scalar: Decimal = Field(1, client_data=ClientFieldData(
         prompt_on_new=True, prompt=lambda mi: "Trend scalar multiplier (-1 to follow trend, 1 to counter trend)"))
     # Inventory-related parameters
     target_inventory_ratio: Decimal = Field(0.5, client_data=ClientFieldData(
@@ -476,111 +476,131 @@ class UpdatedPMM(ScriptStrategyBase):
             return "Market connectors are not ready."
 
         lines = []
+        
+        # Display header with basic info
+        connector = self.connectors[self.config.exchange]
+        current_price = connector.get_price_by_type(self.config.trading_pair, self.price_source)
+        
+        lines.extend([
+            f"\n  {self.config.exchange} | {self.config.trading_pair} | Current Price: {current_price:.8f}",
+            "========================================================================"
+        ])
+        
+        # Display balances
         balance_df = self.get_balance_df()
         lines.extend(["", "  Balances:"] + ["    " + line for line in balance_df.to_string(index=False).split("\n")])
 
+        # Display active orders
         try:
             df = self.active_orders_df()
-            lines.extend(["", "  Orders:"] + ["    " + line for line in df.to_string(index=False).split("\n")])
+            lines.extend(["", "  Active Orders:"] + ["    " + line for line in df.to_string(index=False).split("\n")])
         except ValueError:
             lines.append("\n  No active maker orders.")
 
-        # Add spread information
-        connector = self.connectors[self.config.exchange]
+        # Market metrics section
         best_bid = connector.get_price(self.config.trading_pair, False)
         best_ask = connector.get_price(self.config.trading_pair, True)
         best_bid_spread = (self.reference_price - best_bid) / self.reference_price
         best_ask_spread = (best_ask - self.reference_price) / self.reference_price
+        bid_ask_spread = (best_ask - best_bid) / best_bid
+        
+        lines.extend([
+            "\n  Market Metrics",
+            "  " + "=" * 70,
+            f"  Best Bid: {best_bid:.8f} | Best Ask: {best_ask:.8f} | Spread: {bid_ask_spread * 10000:.2f} bps"
+        ])
 
-        # Calculate price shifts
-        trend_price_shift = self.price_multiplier * self.orig_price
-        inventory_price_shift = self.inventory_multiplier * self.orig_price
-
-        lines.extend(["\n----------------------------------------------------------------------\n"])
-        lines.extend(["  Spreads:"])
-        lines.extend([f"  Bid Spread (bps): {self.current_bid_spread * 10000:.4f} | Best Bid Spread (bps): {best_bid_spread * 10000:.4f}"])
-        lines.extend([f"  Ask Spread (bps): {self.current_ask_spread * 10000:.4f} | Best Ask Spread (bps): {best_ask_spread * 10000:.4f}"])
+        # Spread configuration section
+        lines.extend([
+            "\n  Spread Configuration",
+            "  " + "=" * 70,
+            f"  Bid Spread: {self.current_bid_spread * 10000:.2f} bps | Ask Spread: {self.current_ask_spread * 10000:.2f} bps",
+            f"  Volatility Adjustment: {'ENABLED' if self.config.use_volatility_spread else 'DISABLED'}",
+        ])
         
         if self.config.use_volatility_spread:
-            lines.extend([f"  Volatility Adjustment: ENABLED (Bid Scalar: {self.config.bid_spread_scalar}, Ask Scalar: {self.config.ask_spread_scalar})"])
-        else:
-            lines.extend([f"  Volatility Adjustment: DISABLED (Using base spreads)"])
+            lines.extend([
+                f"  Bid Scalar: {self.config.bid_spread_scalar} | Ask Scalar: {self.config.ask_spread_scalar}"
+            ])
         
-        # Add price shift information
-        lines.extend(["\n----------------------------------------------------------------------\n"])
-        lines.extend(["  Price Shifts:"])
-        lines.extend([f"  Max Shift (bps): {self.config.max_shift_spread * 10000:.4f}"])
+        # Price adjustment section
+        trend_price_shift = self.price_multiplier * self.orig_price
+        inventory_price_shift = self.inventory_multiplier * self.orig_price
+        total_price_shift = self.reference_price - self.orig_price
+        
+        lines.extend([
+            "\n  Price Adjustment",
+            "  " + "=" * 70,
+            f"  Original Price: {self.orig_price:.8f} | Final Reference Price: {self.reference_price:.8f}",
+            f"  Total Price Shift: {total_price_shift:.8f} ({(total_price_shift/self.orig_price) * 10000:.2f} bps)"
+        ])
         
         if self.config.use_trend_price_shift:
-            lines.extend([f"  Trend Adjustment: ENABLED"])
-            lines.extend([f"  Trend Scalar: {self.config.trend_scalar} | Trend Multiplier (bps): {self.price_multiplier * 10000:.4f}"])
-            lines.extend([f"  Trend Price Shift: {trend_price_shift:.8f}"])
-        else:
-            lines.extend([f"  Trend Adjustment: DISABLED"])
+            lines.extend([
+                f"  Trend Adjustment: ENABLED",
+                f"  Trend Scalar: {self.config.trend_scalar} | Trend Shift: {trend_price_shift:.8f} ({self.price_multiplier * 10000:.2f} bps)"
+            ])
         
-        
-    # Add inventory shift information
         if self.config.use_inventory_price_shift:
-            lines.extend([f"  Inventory Adjustment: ENABLED"])
-            lines.extend([f"  Target Ratio: {self.config.target_inventory_ratio} | Current Ratio: {self.current_inventory_ratio:.4f}"])
-            lines.extend([f"  Inventory Delta: {self.inventory_delta:.4f} | Inventory Scalar: {self.config.inventory_scalar}"])
-            lines.extend([f"  Inventory Multiplier (bps): {self.inventory_multiplier * 10000:.4f}"])
-            lines.extend([f"  Inventory Price Shift: {inventory_price_shift:.8f}"])
-        else:
-            lines.extend([f"  Inventory Adjustment: DISABLED"])
+            lines.extend([
+                f"  Inventory Adjustment: ENABLED",
+                f"  Target Ratio: {self.config.target_inventory_ratio} | Current Ratio: {self.current_inventory_ratio:.4f}",
+                f"  Inventory Delta: {self.inventory_delta:.4f} | Inventory Shift: {inventory_price_shift:.8f} ({self.inventory_multiplier * 10000:.2f} bps)"
+            ])
+        
+        # Trend protection section
+        if self.initial_price is not None:
+            lines.extend([
+                "\n  Trend Protection",
+                "  " + "=" * 70,
+                f"  Initial Price: {self.initial_price:.8f} | Current Change: {self.price_change_pct * 100:.2f}%",
+                f"  Protection Active: {self.trend_protection_active} | Direction: {self.trend_direction} (1=up, -1=down)",
+                f"  Protection Threshold: {self.config.trend_threshold * 100:.1f}%"
+            ])
             
-        lines.extend([f"  Original Price: {self.orig_price:.8f} | Final Reference Price: {self.reference_price:.8f}"])
+            if self.trend_protection_active:
+                strategy = "Prioritizing SELLING to lock in profits" if self.trend_direction == 1 else "Cautious buying while reducing exposure"
+                lines.extend([f"  Strategy: {strategy}"])
         
-        # Add trend protection information
-        lines.extend(["\n----------------------------------------------------------------------\n"])
-        lines.extend(["  Trend Protection:"])
-        lines.extend([f"  Initial Price: {self.initial_price:.4f} | Current Price Change: {self.price_change_pct * 100:.2f}%"])
-        lines.extend([f"  Protection Active: {self.trend_protection_active} | Trend Direction: {self.trend_direction}"])
-        lines.extend([f"  Protection Threshold: {self.trend_threshold * 100:.1f}%"])
-        if self.trend_protection_active:
-            if self.trend_direction == 1:
-                lines.extend([f"  Strategy: Prioritizing SELLING to lock in profits (uptrend)"])
-            else:
-                lines.extend([f"  Strategy: Cautious buying while reducing exposure (downtrend)"])
-        else:
-            lines.extend([f"  Strategy: Normal market making"])
-        
-        # Check if candles are ready
+        # Candles and indicators section
         if self.candles is not None:
-            if self.candles.ready and hasattr(self.candles, 'candles_df') and self.candles.candles_df is not None and len(self.candles.candles_df) > 0:
+            candle_status = "Not Ready"
+            if self.candles.ready:
+                candle_status = "Ready"
+                if not hasattr(self.candles, 'candles_df') or self.candles.candles_df is None or len(self.candles.candles_df) == 0:
+                    candle_status = "Ready but no data"
+            
+            lines.extend([
+                "\n  Technical Indicators",
+                "  " + "=" * 70,
+                f"  Candles: {self.config.candle_exchange} | Interval: {self.config.candle_interval} | Status: {candle_status}"
+            ])
+            
+            if candle_status == "Ready" and hasattr(self.candles, 'candles_df') and self.candles.candles_df is not None and len(self.candles.candles_df) > 0:
                 candles_df = self.get_candles_with_features()
                 if candles_df is not None:
-                    lines.extend(["\n----------------------------------------------------------------------"])
-                    lines.extend([f"  Candles: {self.config.candle_exchange} | Interval: {self.config.candle_interval}", ""])
+                    # Display latest indicator values
+                    if f"NATR_{self.config.candle_length}" in candles_df.columns:
+                        lines.extend([f"  Latest NATR: {candles_df[f'NATR_{self.config.candle_length}'].iloc[-1]:.6f}"])
                     
-                    # Get the last n candles according to config
+                    if f"RSI_{self.config.candle_length}" in candles_df.columns:
+                        rsi = candles_df[f"RSI_{self.config.candle_length}"].iloc[-1]
+                        rsi_condition = "Overbought" if rsi > 70 else "Oversold" if rsi < 30 else "Neutral"
+                        lines.extend([f"  Latest RSI: {rsi:.2f} ({rsi_condition})"])
+                    
+                    # Add last few candles
+                    lines.extend(["\n  Recent Candles:"])
                     try:
-                        last_candles = candles_df.tail(min(5, self.config.candle_length)).iloc[::-1]
+                        # Get only essential columns for display
+                        display_cols = ['open_time', 'open', 'high', 'low', 'close', 'volume']
+                        available_cols = [col for col in display_cols if col in candles_df.columns]
+                        
+                        last_candles = candles_df[available_cols].tail(3).iloc[::-1]
                         if len(last_candles) > 0:
                             lines.extend(["    " + line for line in last_candles.to_string(index=False).split("\n")])
-                            
-                            # Show latest indicator values
-                            if f"NATR_{self.config.candle_length}" in candles_df.columns:
-                                lines.extend([f"    Latest NATR: {candles_df[f'NATR_{self.config.candle_length}'].iloc[-1]:.6f}"])
-                            
-                            if f"RSI_{self.config.candle_length}" in candles_df.columns:
-                                lines.extend([f"    Latest RSI: {candles_df[f'RSI_{self.config.candle_length}'].iloc[-1]:.2f}"])
-                        else:
-                            lines.append("    No candle data available.")
                     except Exception as e:
                         lines.append(f"    Error displaying candles: {str(e)}")
-                else:
-                    lines.extend(["\n----------------------------------------------------------------------"])
-                    lines.extend([f"  Candles: {self.config.candle_exchange} | Error calculating indicators"])
-            else:
-                status = "Not ready"
-                if self.candles.ready:
-                    status = "Ready but no data"
-                lines.extend(["\n----------------------------------------------------------------------"])
-                lines.extend([f"  Candles: {self.config.candle_exchange} | Status: {status}", ""])
-                lines.append("  Waiting for candle data to become available...")
         else:
-            lines.extend(["\n----------------------------------------------------------------------"])
-            lines.append("  Candles: Not initialized")
+            lines.extend(["\n  Technical Indicators: Not initialized"])
 
         return "\n".join(lines)
